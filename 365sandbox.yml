@@ -1,0 +1,591 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 365 V1 ECS sandbox Template
+Resources:
+  Cluster365:
+    Properties:
+      ClusterName: 365-v1-sandbox-EcsCluster
+    Type: AWS::ECS::Cluster
+  CloudwatchLogsGroup:
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      RetentionInDays: '14'
+    Type: AWS::Logs::LogGroup
+  LoadBalancerSG:
+    Properties:
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '8080'
+        ToPort: '8080'
+        CidrIp: 0.0.0.0/0
+      VpcId:
+        Ref: VpcId
+      GroupDescription: EC2-SG-VPC-CloudFormation
+      Tags:
+      - Key: Name
+        Value: ECS365-sandbox-alb-sg
+    Type: AWS::EC2::SecurityGroup
+  EcsSecurityGroup:
+    Properties:
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '0'
+        ToPort: '65535'
+        SourceSecurityGroupId:
+          Ref: LoadBalancerSG
+      VpcId:
+        Ref: VpcId
+      GroupDescription: ECS-SG-VPC-CloudFormation
+      Tags:
+      - Key: Name
+        Value: ECS365-sandbox-ecs-sg
+    Type: AWS::EC2::SecurityGroup
+  ECSTaskDefinition365:
+    Properties:
+      Family: ECS365-sandbox
+      ContainerDefinitions:
+      - Name: ECS365-sandbox
+        Image:
+          Ref: Docker365Image
+        Cpu: '512'
+        Essential: 'true'
+        PortMappings:
+        - ContainerPort: '3000'
+          HostPort: '0'
+          Protocol: tcp
+        MemoryReservation: '444'
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: CloudwatchLogsGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: ECS365-sandbox
+    Type: AWS::ECS::TaskDefinition
+  Alb365:
+    Properties:
+      Name: ECS365-sandbox
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '60'
+      Subnets:
+        Ref: SubnetID
+      SecurityGroups:
+      - Ref: LoadBalancerSG
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  ALBListener:
+    Properties:
+      DefaultActions:
+      - TargetGroupArn:
+          Ref: TargetGroup365
+        Type: forward
+      LoadBalancerArn:
+        Ref: Alb365
+      Port: '80'
+      Protocol: HTTP
+    Type: AWS::ElasticLoadBalancingV2::Listener
+  365ListenerRule:
+    Properties:
+      Actions:
+      - TargetGroupArn:
+          Ref: TargetGroup365
+        Type: forward
+      Conditions:
+      - Field: path-pattern
+        Values:
+        - "/health"
+      ListenerArn:
+        Ref: ALBListener
+      Priority: '1'
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+  TargetGroup365:
+    Properties:
+      HealthCheckIntervalSeconds: '300'
+      HealthCheckPath: "/health"
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: '60'
+      HealthyThresholdCount: '10'
+      Name: ECS365Group-sandbox
+      Port: '3000'
+      Protocol: HTTP
+      UnhealthyThresholdCount: '5'
+      VpcId:
+        Ref: VpcId
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+  ECSAutoScalingGroup:
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '4'
+        MinInstancesInService:
+          Ref: DesiredCapacity
+        PauseTime: PT15M
+        WaitOnResourceSignals: 'true'
+    Properties:
+      VPCZoneIdentifier:
+        Ref: SubnetID
+      LaunchConfigurationName:
+        Ref: ContainerInstances
+      MinSize:
+        Ref: DesiredCapacity
+      MaxSize:
+        Ref: MaxSize
+      DesiredCapacity:
+        Ref: DesiredCapacity
+      Tags:
+      - Key: Name
+        Value: ECS365:sandbox
+        PropagateAtLaunch: 'true'
+    Type: AWS::AutoScaling::AutoScalingGroup
+  ContainerInstances:
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_add_instance_to_cluster:
+              command:
+                Fn::Join:
+                - ''
+                - - "#!/bin/bash\n"
+                  - echo ECS_CLUSTER=
+                  - Ref: Cluster365
+                  - " >> /etc/ecs/ecs.config"
+            02_newrelic_infra_nginx:
+              command:
+                Fn::Join:
+                - ''
+                - - "#!/bin/bash\n"
+                  - sudo yum update -y
+        files:
+          "/etc/cfn/cfn-hup.conf":
+            content:
+              Fn::Join:
+              - ''
+              - - "[main]\n"
+                - stack=
+                - Ref: AWS::StackId
+                - "\n"
+                - region=
+                - Ref: AWS::Region
+                - "\n"
+            group: root
+            mode: '000400'
+            owner: root
+          "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+            content:
+              Fn::Join:
+              - ''
+              - - "[cfn-auto-reloader-hook]\n"
+                - 'triggers=post.update
+
+'
+                - 'path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+
+'
+                - 'action=/opt/aws/bin/cfn-init -v '
+                - "         --stack "
+                - Ref: AWS::StackName
+                - "         --resource ContainerInstances "
+                - "         --region "
+                - Ref: AWS::Region
+                - "\n"
+                - 'runas=root
+
+'
+        services:
+          sysvinit:
+            cfn-hup:
+              enabled: 'true'
+              ensureRunning: 'true'
+              files:
+              - "/etc/cfn/cfn-hup.conf"
+              - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+    Properties:
+      ImageId:
+        Ref: ImageId
+      InstanceType:
+        Ref: InstanceType
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      KeyName:
+        Ref: KeyName
+      SecurityGroups:
+      - Ref: EcsSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+          - ''
+          - - "#!/bin/bash -xe\n"
+            - 'yum install -y aws-cfn-bootstrap
+
+'
+            - "/opt/aws/bin/cfn-init -v "
+            - "         --stack "
+            - Ref: AWS::StackName
+            - "         --resource ContainerInstances "
+            - "         --region "
+            - Ref: AWS::Region
+            - "\n"
+            - "/opt/aws/bin/cfn-signal -e $? "
+            - "         --stack "
+            - Ref: AWS::StackName
+            - "         --resource ECSAutoScalingGroup "
+            - "         --region "
+            - Ref: AWS::Region
+            - "\n"
+    Type: AWS::AutoScaling::LaunchConfiguration
+  ECSService365:
+    Properties:
+      ServiceName: ECSService365
+      Cluster:
+        Ref: Cluster365
+      DesiredCount:
+        Ref: TasksCount
+      LoadBalancers:
+      - ContainerName: ECS365-sandbox
+        ContainerPort: '3000'
+        TargetGroupArn:
+          Ref: TargetGroup365
+      Role:
+        Ref: ECSServiceRole
+      TaskDefinition:
+        Ref: ECSTaskDefinition365
+    DependsOn: ALBListener
+    Type: AWS::ECS::Service
+  ECSServiceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ecs.amazonaws.com
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+            - elasticloadbalancing:DeregisterTargets
+            - elasticloadbalancing:Describe*
+            - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+            - elasticloadbalancing:RegisterTargets
+            - ec2:Describe*
+            - ec2:AuthorizeSecurityGroupIngress
+            Effect: Allow
+            Resource: "*"
+        PolicyName: ecs-service
+    Type: AWS::IAM::Role
+  ServiceScalingTarget:
+    DependsOn: ECSService365
+    Properties:
+      MaxCapacity: '10'
+      MinCapacity: '1'
+      ResourceId:
+        Fn::Join:
+        - ''
+        - - service/
+          - Ref: Cluster365
+          - "/"
+          - Fn::GetAtt:
+            - ECSService365
+            - Name
+      RoleARN:
+        Fn::GetAtt:
+        - AutoscalingRole
+        - Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+  RemoveInstances:
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: ECSAutoScalingGroup
+      Cooldown: '300'
+      ScalingAdjustment: "-1"
+    Type: AWS::AutoScaling::ScalingPolicy
+  AddInstances:
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: ECSAutoScalingGroup
+      Cooldown: '300'
+      ScalingAdjustment: '1'
+    Type: AWS::AutoScaling::ScalingPolicy
+  ServiceScalingPolicyOut:
+    Properties:
+      PolicyName: StepUp
+      PolicyType: StepScaling
+      ScalingTargetId:
+        Ref: ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: '300'
+        MetricAggregationType: Average
+        StepAdjustments:
+        - - MetricIntervalLowerBound: '0'
+            ScalingAdjustment: '2'
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  ServiceScalingPolicyIn:
+    Properties:
+      PolicyName: StepDown
+      PolicyType: StepScaling
+      ScalingTargetId:
+        Ref: ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: '300'
+        MetricAggregationType: Average
+        StepAdjustments:
+        - - MetricIntervalLowerBound: '0'
+            ScalingAdjustment:
+              Ref: TasksCount
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  CPUAlarmScaleout:
+    Properties:
+      EvaluationPeriods: '2'
+      Statistic: Average
+      Threshold: '75'
+      AlarmDescription: Alarm if the CPU usage is greater
+      Period: '300'
+      AlarmActions:
+      - Ref: ServiceScalingPolicyOut
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value: ECS365-sandbox
+      - Name: ServiceName
+        Value: ECSService365
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      MetricName: CPUUtilization
+    Type: AWS::CloudWatch::Alarm
+  CPUAlarmScalein:
+    Properties:
+      EvaluationPeriods: '1'
+      Statistic: Average
+      Threshold: '25'
+      AlarmDescription: Alarm if CPU usage is lower, this will always be
+      Period: '300'
+      AlarmActions:
+      - Ref: ServiceScalingPolicyIn
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value: ECS365-sandbox
+      - Name: ServiceName
+        Value: ECSService365
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+    Type: AWS::CloudWatch::Alarm
+  CPUAlarmScaleoutEC2:
+    Properties:
+      EvaluationPeriods: '1'
+      Statistic: Average
+      Threshold: '75'
+      AlarmDescription: Alarm if the MemoryReservation is greater
+      Period: '300'
+      AlarmActions:
+      - Ref: AddInstances
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value: ECS365-sandbox
+      - Name: ServiceName
+        Value: ECSService365
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      MetricName: CPUUtilization
+    Type: AWS::CloudWatch::Alarm
+  CPUAlarmScaleinEC2:
+    Properties:
+      EvaluationPeriods: '1'
+      Statistic: Average
+      Threshold: '25'
+      AlarmDescription: Alarm if memory usage is lower, this will always be
+      Period: '300'
+      AlarmActions:
+      - Ref: RemoveInstances
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value: ECS365-sandbox
+      - Name: ServiceName
+        Value: ECSService365
+      ComparisonOperator: LessThanOrEqualToThreshold
+      MetricName: CPUUtilization
+    Type: AWS::CloudWatch::Alarm
+  EC2Role:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - ecr:GetAuthorizationToken
+            - ecr:BatchCheckLayerAvailability
+            - ecr:GetDownloadUrlForLayer
+            - ecr:GetRepositoryPolicy
+            - ecr:DescribeRepositories
+            - ecr:ListImages
+            - ecr:DescribeImages
+            - ecr:BatchGetImage
+            - ecr:InitiateLayerUpload
+            - ecr:UploadLayerPart
+            - ecr:CompleteLayerUpload
+            - ecs:CreateCluster
+            - ecs:DeregisterContainerInstance
+            - ecs:DiscoverPollEndpoint
+            - ecs:Poll
+            - ecs:RegisterContainerInstance
+            - ecs:StartTelemetrySession
+            - ecs:Submit*
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: "*"
+        PolicyName: ecs-service
+    Type: AWS::IAM::Role
+  AutoscalingRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - application-autoscaling.amazonaws.com
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - application-autoscaling:*
+            - cloudwatch:DescribeAlarms
+            - cloudwatch:PutMetricAlarm
+            - ecs:DescribeServices
+            - ecs:UpdateService
+            Effect: Allow
+            Resource: "*"
+        PolicyName: service-autoscaling
+    Type: AWS::IAM::Role
+  EC2InstanceProfile:
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: EC2Role
+    Type: AWS::IAM::InstanceProfile
+Parameters:
+  Docker365Image:
+    Type: String
+    Description: Specify the image url
+    Default: 1234.aws.com
+  TasksCount:
+    Type: Number
+    Description: number of default tasks
+    Default: 1
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+    Default: 365_non_2
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+  ImageId:
+    Type: String
+    Description: ECS EC2 Instance AMI ID.
+    Default: ami-1234
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select a default VPC ID.
+    Default: vpc-1234
+  SubnetID:
+    Type: CommaDelimitedList
+    Description: Select a default subnet ID in your selected VPC.
+    Default: subnet-1234
+  DesiredCapacity:
+    Type: Number
+    Description: Number of instances to launch in your ECS cluster.
+    Default: 1
+  MaxSize:
+    Type: Number
+    Description: Maximum number of instances that can be launched in your ECS cluster.
+    Default: 2
+  InstanceType:
+    Type: String
+    Description: AppServer EC2 instance type
+    Default: t2.micro
+    ConstraintDescription: must be a valid EC2 instance type
+    AllowedValues:
+    - t1.micro
+    - t2.micro
+    - t2.small
+    - t2.large
+    - t2.medium
+    - m1.small
+    - m1.medium
+    - m1.large
+    - m1.xlarge
+    - m2.xlarge
+    - m2.2xlarge
+    - m2.4xlarge
+    - m3.medium
+    - m3.large
+    - m3.xlarge
+    - m3.2xlarge
+    - c1.medium
+    - c1.xlarge
+    - c3.large
+    - c3.xlarge
+    - c3.2xlarge
+    - c3.4xlarge
+    - c3.8xlarge
+    - c4.large
+    - c4.xlarge
+    - c4.2xlarge
+    - c4.4xlarge
+    - c4.8xlarge
+    - g2.2xlarge
+    - r3.large
+    - r3.xlarge
+    - r3.2xlarge
+    - r3.4xlarge
+    - r3.8xlarge
+    - i2.xlarge
+    - i2.2xlarge
+    - i2.4xlarge
+    - i2.8xlarge
+    - d2.xlarge
+    - d2.2xlarge
+    - d2.4xlarge
+    - d2.8xlarge
+    - hi1.4xlarge
+    - hs1.8xlarge
+    - cr1.8xlarge
+    - cc2.8xlarge
+    - cg1.4xlarge
+Outputs:
+  ECSService365:
+    Value:
+      Ref: ECSService365
+  ecscluster:
+    Value:
+      Ref: Cluster365
+  taskdef:
+    Value:
+      Ref: ECSTaskDefinition365
+
